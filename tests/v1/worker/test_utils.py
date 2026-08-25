@@ -110,6 +110,7 @@ def test_hisparse_spill_batches_wait_for_reused_staging(monkeypatch):
     worker.backup_src_block_stride = 1
     worker.backup_src_block_size = 1
     worker.backup_src_rows = 1
+    worker.backup_row_value_bytes = 1
     worker.host_write_event = MagicMock()
     worker._pending_transfer_events = []
     worker._enqueued_transfer_ids = []
