@@ -28,6 +28,7 @@ from vllm.model_executor.warmup.flashinfer_autotune_cache import (
     write_flashinfer_autotune_cache,
 )
 from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
+    autotune_hisparse_flashinfer_attention,
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
@@ -291,30 +292,12 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
     # which lead to some EP ranks receiving no tokens and skipping their
     # MoE kernel entirely, and cause hang due to all-reduce collective
     # during synchronized autotuning.
-    max_num_tokens = runner.scheduler_config.max_num_batched_tokens
-    max_attention_tokens = runner.get_max_attention_profile_tokens()
-
-    common_dummy_run_kwargs = dict(
+    dummy_run_kwargs = dict(
+        num_tokens=runner.scheduler_config.max_num_batched_tokens,
         skip_eplb=True,
         is_profile=True,
         randomize_inputs=True,
     )
-    dummy_runs = [
-        {
-            **common_dummy_run_kwargs,
-            "num_tokens": max_attention_tokens,
-        }
-    ]
-    if max_attention_tokens < max_num_tokens:
-        # Attention is already tuned over every valid HiSparse decode size.
-        # Tune the remaining kernels at the scheduler's full token capacity.
-        dummy_runs.append(
-            {
-                **common_dummy_run_kwargs,
-                "num_tokens": max_num_tokens,
-                "skip_attn": True,
-            }
-        )
 
     # Read cached autotune results and broadcast to all ranks.
     cached_results: bytes | None = None
@@ -334,8 +317,14 @@ def flashinfer_autotune(runner: "GPUModelRunner") -> None:
             torch.inference_mode(),
             fi_utils.autotune(tune_mode=True, **autotune_kwargs),
         ):
-            for dummy_run_kwargs in dummy_runs:
-                runner._dummy_run(**dummy_run_kwargs)
+            hisparse_enabled = (
+                runner.vllm_config.attention_config.hisparse_config is not None
+            )
+            if hisparse_enabled:
+                # HiSparse hot-buffer attention is bounded by decode batch
+                # size, not the prefill-sized batch used for the full model.
+                autotune_hisparse_flashinfer_attention(runner)
+            runner._dummy_run(**dummy_run_kwargs, skip_attn=hisparse_enabled)
     finally:
         set_autotune_process_group(None)
 
