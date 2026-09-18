@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import json
-from argparse import ArgumentError
+from argparse import SUPPRESS, ArgumentError
 from contextlib import AbstractContextManager, nullcontext
 from typing import Annotated, Literal
 
@@ -11,6 +11,7 @@ from pydantic import Field
 
 from vllm.config import AttentionConfig, CompilationConfig, ModelConfig, config
 from vllm.engine.arg_utils import (
+    PREFIX_CACHE_RETENTION_INTERVAL_UNSET,
     EngineArgs,
     _expand_json_human_readable_numbers,
     contains_type,
@@ -593,7 +594,12 @@ def test_prefix_cache_default():
     # should be None by default (depends on model).
     engine_args = EngineArgs.from_cli_args(args=args)
     assert engine_args.enable_prefix_caching is None
-    assert engine_args.prefix_cache_retention_interval == 0
+    # Left as an unresolved sentinel; create_engine_config resolves it against
+    # the model and speculative-decoding configuration.
+    assert (
+        engine_args.prefix_cache_retention_interval
+        is PREFIX_CACHE_RETENTION_INTERVAL_UNSET
+    )
 
     # with flag to turn it on.
     args = parser.parse_args(["--enable-prefix-caching"])
@@ -1009,3 +1015,17 @@ class TestDpDeviceIdSharding:
             get_physical_gpu_ids_for_local_dp_rank(
                 evar, local_dp_rank=2, world_size=2, user_assigned_gpu_ids=[4, 5, 6, 7]
             )
+
+
+def test_prefix_cache_retention_interval_unset_sentinel_is_not_user_visible():
+    """The unset sentinel is an internal marker. It must not reach --help or
+    the generated CLI docs, which render any default that is neither
+    SUPPRESS nor None."""
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    action = next(
+        a
+        for a in parser._actions
+        if "--prefix-cache-retention-interval" in a.option_strings
+    )
+    assert action.default is SUPPRESS
+    assert "UNSET" not in parser.format_help()
