@@ -15,6 +15,7 @@ from typing import (
     TYPE_CHECKING,
     Annotated,
     Any,
+    ClassVar,
     Literal,
     TypeAlias,
     TypeVar,
@@ -171,6 +172,29 @@ def optional_type(return_type: Callable[[str], T]) -> Callable[[str], T | None]:
         return parse_type(return_type)(val)
 
     return _optional_type
+
+
+class _UnsetType:
+    """Sentinel marking that an argument was not provided by the user."""
+
+    _instance: ClassVar["_UnsetType | None"] = None
+
+    def __new__(cls) -> "_UnsetType":
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "UNSET"
+
+    def __reduce__(self) -> tuple[type, tuple]:
+        return (_UnsetType, ())
+
+
+PREFIX_CACHE_RETENTION_INTERVAL_UNSET = _UnsetType()
+"""Default of ``EngineArgs.prefix_cache_retention_interval`` when neither the
+CLI flag nor a programmatic value was provided, so that the default can be
+resolved against the model and speculative-decoding configuration."""
 
 
 def union_dict_and_str(val: str) -> str | dict[str, str] | None:
@@ -553,9 +577,10 @@ class EngineArgs:
     prefix_caching_hash_algo: PrefixCachingHashAlgo = (
         CacheConfig.prefix_caching_hash_algo
     )
-    prefix_cache_retention_interval: int | None = get_field(
-        CacheConfig, "prefix_cache_retention_interval"
-    )
+    # Defaults to a sentinel so an unset value can be told apart from an
+    # explicit one; resolved in create_engine_config (0, or dense checkpoints
+    # for hybrid models with EAGLE-style speculative decoding).
+    prefix_cache_retention_interval: int | None = PREFIX_CACHE_RETENTION_INTERVAL_UNSET  # type: ignore[assignment]
     disable_sliding_window: bool = ModelConfig.disable_sliding_window
     disable_cascade_attn: bool = ModelConfig.disable_cascade_attn
     offload_backend: str = OffloadConfig.offload_backend
@@ -1302,7 +1327,13 @@ class EngineArgs:
         )
         cache_group.add_argument(
             "--prefix-cache-retention-interval",
-            **cache_kwargs["prefix_cache_retention_interval"],
+            # SUPPRESS keeps the sentinel out of --help and the generated CLI
+            # docs; `from_cli_args` skips attributes argparse did not set, so
+            # the dataclass default (the sentinel) still applies.
+            **{
+                **cache_kwargs["prefix_cache_retention_interval"],
+                "default": argparse.SUPPRESS,
+            },
         )
         cache_group.add_argument(
             "--kv-cache-dtype-skip-layers", **cache_kwargs["kv_cache_dtype_skip_layers"]
@@ -2105,6 +2136,18 @@ class EngineArgs:
             "enable_prefix_caching must be set by this point"
         )
 
+        retention_interval_unset = (
+            self.prefix_cache_retention_interval
+            is PREFIX_CACHE_RETENTION_INTERVAL_UNSET
+        )
+        # When unset, apply the CacheConfig default for now; it is resolved
+        # further below once speculative_config is known.
+        retention_interval = (
+            CacheConfig.prefix_cache_retention_interval
+            if retention_interval_unset
+            else self.prefix_cache_retention_interval
+        )
+
         cache_config = CacheConfig(
             block_size=self.block_size,  # type: ignore[arg-type]
             gpu_memory_utilization=self.gpu_memory_utilization,
@@ -2115,7 +2158,7 @@ class EngineArgs:
             sliding_window=sliding_window,
             enable_prefix_caching=self.enable_prefix_caching,
             prefix_caching_hash_algo=self.prefix_caching_hash_algo,
-            prefix_cache_retention_interval=self.prefix_cache_retention_interval,
+            prefix_cache_retention_interval=retention_interval,
             kv_cache_dtype_skip_layers=self.kv_cache_dtype_skip_layers,
             kv_sharing_fast_prefill=self.kv_sharing_fast_prefill,
             mamba_cache_dtype=self.mamba_cache_dtype,
@@ -2419,6 +2462,22 @@ class EngineArgs:
         )
         diffusion_config = self.create_diffusion_config()
         watermark_config = self.create_watermark_config()
+
+        if (
+            retention_interval_unset
+            and model_config.is_hybrid
+            and speculative_config is not None
+            and speculative_config.use_eagle()
+        ):
+            # The default sparse retention (0) keeps only the latest replay
+            # boundary, which EAGLE's tail-block drop makes unreachable for
+            # Mamba state checkpoints, so prefix caching never hits. Default
+            # to dense checkpoints instead.
+            cache_config.prefix_cache_retention_interval = None
+            logger.info_once(
+                "Hybrid model with EAGLE speculative decoding: defaulting "
+                "prefix_cache_retention_interval to dense checkpointing."
+            )
 
         self._set_default_max_num_seqs_and_batched_tokens_args(
             usage_context,

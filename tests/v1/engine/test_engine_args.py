@@ -5,6 +5,7 @@ from argparse import ArgumentError
 
 import pytest
 
+from vllm.config import ModelConfig, SpeculativeConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.usage.usage_lib import UsageContext
 from vllm.utils.argparse_utils import FlexibleArgumentParser
@@ -121,3 +122,68 @@ def test_data_parallel_start_rank_zero_infers_hybrid_lb():
 
     assert vllm_config.parallel_config.data_parallel_hybrid_lb is True
     assert vllm_config.parallel_config.data_parallel_rank == 0
+
+
+@pytest.mark.parametrize(
+    ("is_hybrid", "use_eagle", "explicit", "expected"),
+    [
+        pytest.param(True, True, "unset", None, id="hybrid-eagle-dense"),
+        pytest.param(True, True, 0, 0, id="hybrid-eagle-explicit-zero"),
+        pytest.param(True, True, None, None, id="hybrid-eagle-explicit-none"),
+        pytest.param(True, True, 64, 64, id="hybrid-eagle-explicit-interval"),
+        pytest.param(True, False, "unset", 0, id="hybrid-without-spec-decode"),
+        pytest.param(True, "ngram", "unset", 0, id="hybrid-with-non-eagle-spec"),
+        pytest.param(False, True, "unset", 0, id="eagle-without-hybrid"),
+        pytest.param(False, False, "unset", 0, id="plain-model"),
+    ],
+)
+def test_prefix_cache_retention_interval_default_resolution(
+    monkeypatch, is_hybrid, use_eagle, explicit, expected
+):
+    """An unset ``prefix_cache_retention_interval`` resolves to dense (None)
+    for hybrid models with EAGLE-style speculative decoding — sparse retention
+    (0) leaves no reachable Mamba state checkpoints under EAGLE, so prefix
+    caching never hits — and to 0 otherwise. Explicit values are respected."""
+    monkeypatch.setattr(ModelConfig, "is_hybrid", property(lambda self: is_hybrid))
+    if use_eagle:
+        spec_config = SpeculativeConfig(model="ngram", num_speculative_tokens=1)
+        # `use_eagle` doubles as the method when it is a string, so a
+        # non-EAGLE drafter can be told apart from no drafter at all.
+        spec_config.method = use_eagle if isinstance(use_eagle, str) else "eagle"
+        monkeypatch.setattr(
+            EngineArgs,
+            "create_speculative_config",
+            lambda self, **kwargs: spec_config,
+        )
+    engine_kwargs = (
+        {} if explicit == "unset" else {"prefix_cache_retention_interval": explicit}
+    )
+    vllm_config = EngineArgs(
+        model="Qwen/Qwen3-0.6B", **engine_kwargs
+    ).create_engine_config()
+    assert vllm_config.cache_config.prefix_cache_retention_interval == expected
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        pytest.param([], None, id="unset-resolves-to-dense"),
+        pytest.param(["--prefix-cache-retention-interval", "0"], 0, id="explicit-zero"),
+        pytest.param(
+            ["--prefix-cache-retention-interval", "64"], 64, id="explicit-interval"
+        ),
+    ],
+)
+def test_prefix_cache_retention_interval_through_the_cli(monkeypatch, argv, expected):
+    """An explicit 0 on the command line must survive the hybrid + EAGLE
+    default resolution; only an omitted flag resolves to dense."""
+    monkeypatch.setattr(ModelConfig, "is_hybrid", property(lambda self: True))
+    spec_config = SpeculativeConfig(model="ngram", num_speculative_tokens=1)
+    spec_config.method = "eagle"
+    monkeypatch.setattr(
+        EngineArgs, "create_speculative_config", lambda self, **kwargs: spec_config
+    )
+    parser = EngineArgs.add_cli_args(FlexibleArgumentParser())
+    args = parser.parse_args(["--model", "Qwen/Qwen3-0.6B", *argv])
+    vllm_config = EngineArgs.from_cli_args(args=args).create_engine_config()
+    assert vllm_config.cache_config.prefix_cache_retention_interval == expected
