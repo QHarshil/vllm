@@ -4383,3 +4383,44 @@ def test_trailing_layer_fallback_requires_exact_partition():
     _annotate_eagle_groups(config, specs, trimmed, use_trailing_layer_fallback=True)
 
     assert not any(g.is_eagle_group for g in trimmed)
+
+
+def test_record_hash_block_size_is_idempotent_and_rejects_conflicts():
+    """Workers may be handed the engine's unit more than once, but two
+    components matching prefixes at different granularities is the failure
+    this plumbing exists to prevent."""
+    cache_config = CacheConfig()
+    kv_cache_utils.record_hash_block_size(cache_config, 32)
+    kv_cache_utils.record_hash_block_size(cache_config, 32)
+    assert cache_config.get_resolved_hash_block_size() == 32
+    with pytest.raises(ValueError, match="already resolved"):
+        kv_cache_utils.record_hash_block_size(cache_config, 16)
+
+
+def test_resolved_hash_block_size_fails_closed():
+    """A consumer that was never told the engine's unit must raise rather than
+    fall back to its own block size."""
+    with pytest.raises(ValueError, match="has not been resolved"):
+        CacheConfig().get_resolved_hash_block_size()
+
+
+def test_recording_the_resolved_unit_leaves_user_intent_alone():
+    """`prefix_match_unit` is the user's request; `None` keeps meaning 'derive
+    it', so resolution must not overwrite it."""
+    cache_config = CacheConfig()
+    assert cache_config.prefix_match_unit is None
+    kv_cache_utils.record_hash_block_size(cache_config, 32)
+    assert cache_config.prefix_match_unit is None
+
+
+def test_kv_cache_config_geometry_accessors_fail_closed():
+    config = KVCacheConfig(num_blocks=1, kv_cache_tensors=[], kv_cache_groups=[])
+    with pytest.raises(ValueError, match="scheduler_block_size"):
+        config.get_scheduler_block_size()
+    with pytest.raises(ValueError, match="hash_block_size"):
+        config.get_hash_block_size()
+    config.scheduler_block_size, config.hash_block_size = 528, 16
+    assert (config.get_scheduler_block_size(), config.get_hash_block_size()) == (
+        528,
+        16,
+    )

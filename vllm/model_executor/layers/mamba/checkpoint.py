@@ -78,12 +78,24 @@ class MambaPrefillCheckpointBuilder:
     ) -> MambaPrefillCheckpointMetadata | None:
         if self.kv_cache_spec.num_prefill_checkpoint_blocks == 0:
             return None
+        if self.vllm_config.cache_config.resolved_hash_block_size is None:
+            # Memory profiling builds attention metadata before the engine core
+            # has resolved the prefix-cache geometry, and a PIECEWISE capture
+            # batch reaches here because `split_decodes_and_prefills` counts
+            # dummy rows with query_len > 1 as prefills. There is no prefix
+            # cache to align to during profiling, so there is nothing to
+            # checkpoint. A missing stamp in a real run still aborts startup,
+            # where `EngineCore.__init__` reads the geometry back.
+            return None
         assert m.seq_lens_cpu_upper_bound is not None
         all_query_lens = m.query_start_loc_cpu.diff().tolist()
         query_lens = [all_query_lens[row] for row in request_rows]
         seq_lens = m.seq_lens_cpu_upper_bound.tolist()
         block_size = self.kv_cache_spec.block_size
-        hash_block_size = self.vllm_config.cache_config.prefix_match_unit or block_size
+        # The engine core's unit, not this worker's block size: checkpoint
+        # positions have to land where the scheduler registered them.
+        cache_config = self.vllm_config.cache_config
+        hash_block_size = cache_config.get_resolved_hash_block_size()
         speculative_config = self.vllm_config.speculative_config
         drop_eagle_block = (
             speculative_config is not None and speculative_config.use_eagle_block_drop()

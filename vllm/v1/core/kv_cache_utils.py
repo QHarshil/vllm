@@ -13,7 +13,7 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, NewType, TypeAlias, cast, overload
 
 from vllm import envs
-from vllm.config import VllmConfig
+from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
 from vllm.utils.hashing import xxhash, xxhash_cbor
 from vllm.utils.math_utils import cdiv, round_up
@@ -726,6 +726,22 @@ def dcp_world_size_for_kv_cache_spec(spec: KVCacheSpec, dcp_world_size: int) -> 
     if isinstance(inner, FullAttentionSpec):
         return dcp_world_size
     return 1
+
+
+def record_hash_block_size(cache_config: CacheConfig, hash_block_size: int) -> None:
+    """Adopt the prefix-cache match unit resolved by the engine core.
+
+    Idempotent, so a worker may be handed the same value more than once, but a
+    conflicting value is an error: two components matching prefixes at
+    different granularities is the failure this plumbing exists to prevent.
+    """
+    existing = cache_config.resolved_hash_block_size
+    if existing is not None and existing != hash_block_size:
+        raise ValueError(
+            f"Prefix-cache hash block size is already resolved to {existing}; "
+            f"cannot change it to {hash_block_size}."
+        )
+    cache_config.resolved_hash_block_size = hash_block_size
 
 
 def resolve_kv_cache_block_sizes(
