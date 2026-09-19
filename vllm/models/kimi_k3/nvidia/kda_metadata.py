@@ -640,9 +640,10 @@ class KimiK3KDAMetadataBuilder(GDNAttentionMetadataBuilder):
             query_lens = [all_query_lens[row] for row in request_rows]
             seq_lens = m.seq_lens_cpu_upper_bound.tolist()
             block_size = self.kv_cache_spec.block_size
-            hash_block_size = (
-                self.vllm_config.cache_config.prefix_match_unit or block_size
-            )
+            # The engine core's unit, not this worker's block size: checkpoint
+            # positions have to land where the scheduler registered them.
+            cache_config = self.vllm_config.cache_config
+            hash_block_size = cache_config.get_resolved_hash_block_size()
             speculative_config = self.vllm_config.speculative_config
             drop_eagle_block = (
                 speculative_config is not None

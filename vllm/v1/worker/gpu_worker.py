@@ -80,6 +80,7 @@ from vllm.utils.mem_utils import (
 )
 from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtime
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
+from vllm.v1.core.kv_cache_utils import record_hash_block_size
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
@@ -746,6 +747,12 @@ class Worker(WorkerBase):
         # (e.g. elastic EP scale-up) only see it through the config.
         if kv_cache_config.kv_cache_layout is not None:
             record_kv_cache_layout(self.cache_config, kv_cache_config.kv_cache_layout)
+
+        # Same reasoning for the prefix-cache match unit: workers must match
+        # prefixes at the granularity the engine core resolved, not one they
+        # derive from their own config.
+        if kv_cache_config.hash_block_size is not None:
+            record_hash_block_size(self.cache_config, kv_cache_config.hash_block_size)
 
         # Init kv cache connector here, because it requires
         # `kv_cache_config`.

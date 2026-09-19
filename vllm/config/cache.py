@@ -203,6 +203,15 @@ class CacheConfig:
     replayssm_buffer_len, but this is not required."""
     use_kda_recoverssm: bool = field(default=False, init=False)
     """Whether Kimi-K3 KDA uses RecoverSSM speculative decode."""
+    resolved_hash_block_size: int | None = field(default=None, init=False)
+    """The prefix-cache match unit the engine core actually resolved, in tokens.
+
+    `prefix_match_unit` is the user's request and stays untouched: `None` there
+    means "derive it from the runtime KV cache group geometry". This field is
+    that derivation's result, published to every worker through
+    `KVCacheConfig.hash_block_size` so the scheduler and the workers cannot
+    disagree about where a prefix may match. Read it with
+    `get_resolved_hash_block_size()`."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
@@ -274,6 +283,7 @@ class CacheConfig:
             "prefix_cache_retention_interval",
             # Prefix-caching implementation detail (doesn't affect compiled graph).
             "prefix_match_unit",
+            "resolved_hash_block_size",
             "enable_mamba_fine_grained_prefix_cache",
             "mamba_page_size_padded",
             "skip_page_size_padded",
@@ -365,3 +375,20 @@ class CacheConfig:
                 "set by the user."
             )
         return _layout_from_name(self.kv_cache_layout)
+
+    def get_resolved_hash_block_size(self) -> int:
+        """The engine-resolved prefix-cache match unit, in tokens.
+
+        Fails closed: a consumer that has not been told the engine's unit must
+        not fall back to its own block size, because matching at a different
+        granularity than the scheduler produces cache entries whose boundaries
+        the two sides disagree about.
+        """
+        if self.resolved_hash_block_size is None:
+            raise ValueError(
+                "The prefix-cache hash block size has not been resolved yet; it "
+                "is resolved once by the engine core "
+                "(resolve_kv_cache_block_sizes) and published to workers through "
+                "KVCacheConfig.hash_block_size."
+            )
+        return self.resolved_hash_block_size

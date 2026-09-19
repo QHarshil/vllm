@@ -7,9 +7,11 @@ from unittest.mock import patch
 
 import pytest
 
+from vllm.config import CacheConfig
 from vllm.utils.mem_constants import GiB_bytes
+from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker import gpu_worker, startup_plan
-from vllm.v1.worker.gpu_worker import maybe_rocm_profiling_fallback
+from vllm.v1.worker.gpu_worker import Worker, maybe_rocm_profiling_fallback
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
     maybe_save_startup_plan,
@@ -221,3 +223,65 @@ def test_execute_model_waits_previous_pp_send_before_forward(
 
     assert log == ["wait:prev-tensor", "forward", "isend"]
     assert worker._pp_send_work == [tensor_handle]
+
+
+# Engine-resolved KV cache geometry (vllm/v1/engine/core.py resolves it once
+# and ships it on the KVCacheConfig; Worker.initialize_from_config adopts it).
+
+
+def _adopting_worker(cache_config):
+    """The minimal Worker surface initialize_from_config touches before it
+    reaches any device work."""
+    return SimpleNamespace(
+        cache_config=cache_config,
+        vllm_config=SimpleNamespace(),
+        model_config=SimpleNamespace(enable_return_routed_experts=False),
+        model_runner=SimpleNamespace(initialize_kv_cache=lambda *a, **k: None),
+        _maybe_get_memory_pool_context=lambda tag: nullcontext(),
+    )
+
+
+def _stamped_config(hash_block_size):
+    return KVCacheConfig(
+        num_blocks=4,
+        kv_cache_tensors=[],
+        kv_cache_groups=[],
+        hash_block_size=hash_block_size,
+    )
+
+
+@pytest.fixture
+def no_kv_transfer(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        gpu_worker, "ensure_kv_transfer_initialized", lambda *args, **kwargs: None
+    )
+
+
+def test_worker_adopts_the_engine_resolved_hash_block_size(no_kv_transfer):
+    """A worker must take the match unit off the KVCacheConfig it is
+    initialized with. Deriving one locally lets it register or look up cache
+    entries at boundaries the scheduler never meant."""
+    cache_config = CacheConfig()
+    Worker.initialize_from_config(_adopting_worker(cache_config), _stamped_config(32))
+    assert cache_config.get_resolved_hash_block_size() == 32
+
+
+def test_worker_adoption_is_idempotent(no_kv_transfer):
+    """Re-initializing a worker with the same engine value is fine; this is
+    what a recreated or late-joining worker sees."""
+    cache_config = CacheConfig()
+    worker = _adopting_worker(cache_config)
+    Worker.initialize_from_config(worker, _stamped_config(32))
+    Worker.initialize_from_config(worker, _stamped_config(32))
+    assert cache_config.get_resolved_hash_block_size() == 32
+
+
+def test_worker_rejects_a_conflicting_hash_block_size(no_kv_transfer):
+    """Two components matching prefixes at different granularities is the
+    failure this plumbing prevents, so a conflicting value must not be
+    adopted silently."""
+    cache_config = CacheConfig()
+    worker = _adopting_worker(cache_config)
+    Worker.initialize_from_config(worker, _stamped_config(32))
+    with pytest.raises(ValueError, match="already resolved"):
+        Worker.initialize_from_config(worker, _stamped_config(16))

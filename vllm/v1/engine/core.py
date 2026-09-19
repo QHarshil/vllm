@@ -51,6 +51,7 @@ from vllm.v1.core.kv_cache_utils import (
     get_kv_cache_configs,
     get_request_block_hasher,
     init_none_hash,
+    record_hash_block_size,
     resolve_kv_cache_block_sizes,
     update_kv_cache_capacity,
 )
@@ -159,9 +160,11 @@ class EngineCore:
                 logger.warning("Disabling chunked prefill for model without KVCache")
                 vllm_config.scheduler_config.enable_chunked_prefill = False
 
-        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
-            kv_cache_config, vllm_config
-        )
+        # Resolved in _initialize_kv_caches and published to the workers; read
+        # it back rather than resolving a second time, so the scheduler and the
+        # workers provably share one value.
+        scheduler_block_size = kv_cache_config.get_scheduler_block_size()
+        hash_block_size = kv_cache_config.get_hash_block_size()
 
         self.scheduler: SchedulerInterface = Scheduler(
             vllm_config=vllm_config,
@@ -355,6 +358,21 @@ class EngineCore:
             update_kv_cache_capacity(vllm_config, scheduler_kv_cache_config)
 
         vllm_config.validate_block_size()
+
+        # Resolve the prefix-cache geometry once, from the scheduler's view of
+        # the groups, and stamp it onto every config before the workers receive
+        # theirs. Workers must be told the engine's units rather than deriving
+        # their own: a worker that re-derives can disagree with the scheduler
+        # that owns the request state, and a worker created later (elastic EP
+        # scale-up, restart) would otherwise resolve against whatever its own
+        # config says.
+        scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
+            scheduler_kv_cache_config, vllm_config
+        )
+        for config in (scheduler_kv_cache_config, *kv_cache_configs):
+            config.scheduler_block_size = scheduler_block_size
+            config.hash_block_size = hash_block_size
+        record_hash_block_size(vllm_config.cache_config, hash_block_size)
 
         self.model_executor.initialize_from_config(kv_cache_configs)
         if not envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:

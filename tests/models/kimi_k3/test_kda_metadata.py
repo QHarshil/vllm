@@ -13,7 +13,7 @@ from tests.v1.attention.utils import (
     create_common_attn_metadata,
     create_vllm_config,
 )
-from vllm.config import SpeculativeConfig
+from vllm.config import CacheConfig, SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.models.kimi_k3.nvidia.kda_metadata import (
     KimiK3KDAAttentionBackend,
@@ -37,6 +37,7 @@ from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
     mamba_get_block_table_tensor,
 )
+from vllm.v1.core.kv_cache_utils import record_hash_block_size
 from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.worker.mamba_utils import validate_mamba_state_copy_funcs
 
@@ -96,6 +97,7 @@ def _make_builder(
     num_prefill_checkpoint_blocks: int = 0,
     mamba_block_size: int = BLOCK_SIZE,
     prefix_match_unit: int | None = None,
+    resolved_hash_block_size: int | None = None,
     use_eagle: bool = False,
     disable_eagle_block_drop: bool = False,
 ) -> AttentionMetadataBuilder:
@@ -120,6 +122,15 @@ def _make_builder(
     vllm_config.cache_config.use_replayssm = use_recoverssm
     vllm_config.cache_config.use_kda_recoverssm = use_recoverssm
     vllm_config.cache_config.prefix_match_unit = prefix_match_unit
+    # Stand in for the engine core: publish the resolved match unit. The
+    # fallback reproduces what the builder used to derive locally, so the
+    # existing cases keep their meaning.
+    record_hash_block_size(
+        vllm_config.cache_config,
+        resolved_hash_block_size
+        if resolved_hash_block_size is not None
+        else (prefix_match_unit or mamba_block_size),
+    )
     builder = builder_cls(
         kv_cache_spec=MambaSpec(
             block_size=mamba_block_size,
@@ -191,10 +202,11 @@ def test_kda_recoverssm_startup_metadata_flow_without_model(monkeypatch):
         model_config=SimpleNamespace(
             hf_text_config=SimpleNamespace(linear_key_head_dim=32)
         ),
-        cache_config=SimpleNamespace(
+        cache_config=_stub_cache_config(
             mamba_cache_mode="align",
             use_kda_recoverssm=True,
             prefix_match_unit=None,
+            resolved_hash_block_size=BLOCK_SIZE,
         ),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
         speculative_config=SimpleNamespace(
@@ -317,6 +329,19 @@ def test_internal_checkpoint_metadata_targets_last_aligned_boundary():
         actual.checkpoint.checkpoint_offsets,
         torch.tensor([48, 0], dtype=torch.int32, device=device),
     )
+
+
+def _stub_cache_config(resolved_hash_block_size: int | None = None, **kwargs):
+    """A cache_config stub that answers the engine-resolved accessors.
+
+    Binds the real `CacheConfig` method so the stub keeps the fail-closed
+    behaviour instead of quietly returning a local block size.
+    """
+    stub = SimpleNamespace(resolved_hash_block_size=resolved_hash_block_size, **kwargs)
+    stub.get_resolved_hash_block_size = (
+        lambda: CacheConfig.get_resolved_hash_block_size(stub)
+    )
+    return stub
 
 
 @pytest.mark.parametrize(
@@ -1022,3 +1047,54 @@ def test_cudagraph_capture_batch_stays_decode_only():
     assert staged is not None
     assert staged.data_ptr() == builder.non_spec_state_indices_tensor.data_ptr()
     torch.testing.assert_close(staged, common_attn_metadata.block_table_tensor[:, 0])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_internal_checkpoint_follows_the_engine_resolved_match_unit() -> None:
+    """The builder must use the match unit the engine core resolved, not one
+    it derives from its own block size.
+
+    The user set no `--prefix-match-unit`, so the old local derivation
+    (`prefix_match_unit or block_size`) would pick the 64-token Mamba block and
+    place the checkpoint where the scheduler never registered one. The engine
+    resolved 16, which is the boundary the scheduler used, and at 16 this is
+    the same checkpoint the explicit-flag case above produces.
+    """
+    device = torch.device("cuda")
+    batch = BatchSpec(seq_lens=[100], query_lens=[100])
+    common_attn_metadata = create_common_attn_metadata(
+        batch, BLOCK_SIZE, device, arange_block_indices=True
+    )
+    common_attn_metadata = common_attn_metadata.replace(
+        is_prefilling=torch.tensor([True]),
+        block_table_tensor=common_attn_metadata.block_table_tensor + 1,
+    )
+    builder = _make_builder(
+        KimiK3KDAMetadataBuilder,
+        num_speculative_tokens=3,
+        full_cuda_graph=False,
+        mamba_cache_mode="align",
+        num_prefill_checkpoint_blocks=1,
+        mamba_block_size=64,
+        prefix_match_unit=None,
+        resolved_hash_block_size=16,
+        use_eagle=True,
+        disable_eagle_block_drop=False,
+        device=device,
+    )
+    assert isinstance(builder, KimiK3KDAMetadataBuilder)
+    builder.mamba_aligned_state_indices = mamba_get_block_table_tensor(
+        common_attn_metadata.block_table_tensor,
+        common_attn_metadata.seq_lens,
+        builder.kv_cache_spec,
+        "align",
+    )
+    actual = builder.build(0, common_attn_metadata)
+
+    # Deriving the unit locally would give 64, whose checkpoint position floors
+    # to 0 and is rejected as invalid, so this would read None instead.
+    assert actual.checkpoint is not None
+    torch.testing.assert_close(
+        actual.checkpoint.checkpoint_offsets,
+        torch.tensor([80], dtype=torch.int32, device=device),
+    )

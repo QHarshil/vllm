@@ -1447,6 +1447,16 @@ class KVCacheConfig:
     """Resolved retention policy for local prefix-cache checkpoints."""
     kv_cache_layout: str | None = None
     """The KV cache layout resolved by the engine core, adopted by all workers."""
+    scheduler_block_size: int | None = None
+    """Token alignment the scheduler rounds to, resolved by the engine core."""
+    hash_block_size: int | None = None
+    """Granularity of `Request.block_hashes`, resolved by the engine core.
+
+    Carried here so every worker adopts the same value the scheduler used.
+    Components that match prefixes must agree on this: a worker that derives
+    its own unit can register or look up cache entries at boundaries the
+    scheduler never meant, which for recurrent state means resuming from the
+    wrong checkpoint."""
     hisparse_host_num_blocks: int | None = None
     """Capacity of the dedicated HiSparse host-block manager, when enabled."""
 
@@ -1455,6 +1465,24 @@ class KVCacheConfig:
 
     hisparse_shared_host_pool: bool = False
     """Whether local TP ranks share one physical HiSparse host pool."""
+
+    def get_scheduler_block_size(self) -> int:
+        """Token alignment resolved by the engine core. Fails closed."""
+        if self.scheduler_block_size is None:
+            raise ValueError(
+                "scheduler_block_size has not been resolved yet; the engine "
+                "core resolves it in _initialize_kv_caches."
+            )
+        return self.scheduler_block_size
+
+    def get_hash_block_size(self) -> int:
+        """Prefix-cache match unit resolved by the engine core. Fails closed."""
+        if self.hash_block_size is None:
+            raise ValueError(
+                "hash_block_size has not been resolved yet; the engine core "
+                "resolves it in _initialize_kv_caches."
+            )
+        return self.hash_block_size
 
     @cached_property
     def transfer_group_ids(self) -> tuple[int, ...]:
